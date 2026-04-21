@@ -22,8 +22,14 @@ model.
 #include "secret-detector.h"
 
 #define OCR_INTERVAL_NS_DEFAULT 500000000ULL    /* 500 ms = 2 Hz */
-#define REGION_TTL_NS_DEFAULT   1500000000ULL   /* keep censor up 1.5s after last detect */
-#define REGION_PAD_PCT_DEFAULT  0.10f
+#define REGION_TTL_NS_DEFAULT   2500000000ULL   /* keep censor up 2.5s after last detect */
+#define REGION_PAD_PCT_DEFAULT  0.20f           /* extend each detection by 20% */
+/* Cap extrapolation so a stale region with old velocity doesn't slide across
+ * the whole screen. Past this age we freeze the region in place. */
+#define MOTION_EXTRAP_MAX_NS    400000000ULL    /* 400 ms */
+/* Low-pass factor for velocity updates: new = α·measured + (1-α)·previous.
+ * Low α = smoother but slower to react; high α = jumpy. */
+#define MOTION_VELOCITY_ALPHA   0.6f
 #define MAX_REGIONS             64
 #define MASK_W                  320
 #define MASK_H                  180
@@ -38,6 +44,7 @@ model.
 
 struct sg_region {
 	float x, y, w, h; /* normalized UV, top-left origin */
+	float vx, vy;     /* UV units per second, EMA-smoothed */
 	uint64_t last_seen_ns;
 };
 
@@ -107,6 +114,24 @@ static void streamguard_add_region(struct streamguard_filter *f, float x, float 
 		float ax = fminf(r->x + r->w, x + w);
 		float ay = fminf(r->y + r->h, y + h);
 		if (ax > ix && ay > iy) {
+			/* Velocity from center-to-center motion since last sighting.
+			 * Updated via EMA so a single jittery OCR bbox doesn't fling
+			 * the extrapolated region across the screen. */
+			uint64_t dt_ns = now_ns - r->last_seen_ns;
+			if (dt_ns > 10000000ULL) { /* >10ms — ignore same-tick duplicates */
+				float dt = (float)dt_ns / 1.0e9f;
+				float old_cx = r->x + r->w * 0.5f;
+				float old_cy = r->y + r->h * 0.5f;
+				float new_cx = x + w * 0.5f;
+				float new_cy = y + h * 0.5f;
+				float meas_vx = (new_cx - old_cx) / dt;
+				float meas_vy = (new_cy - old_cy) / dt;
+				r->vx = MOTION_VELOCITY_ALPHA * meas_vx +
+					(1.0f - MOTION_VELOCITY_ALPHA) * r->vx;
+				r->vy = MOTION_VELOCITY_ALPHA * meas_vy +
+					(1.0f - MOTION_VELOCITY_ALPHA) * r->vy;
+			}
+			/* Union of new and old rects so neither escapes the censor. */
 			float nx = fminf(r->x, x);
 			float ny = fminf(r->y, y);
 			r->w = fmaxf(r->x + r->w, x + w) - nx;
@@ -122,6 +147,7 @@ static void streamguard_add_region(struct streamguard_filter *f, float x, float 
 	if (f->region_count < MAX_REGIONS) {
 		struct sg_region *r = &f->regions[f->region_count++];
 		r->x = x; r->y = y; r->w = w; r->h = h;
+		r->vx = 0.0f; r->vy = 0.0f;
 		r->last_seen_ns = now_ns;
 	}
 	pthread_mutex_unlock(&f->regions_mutex);
@@ -170,16 +196,31 @@ static void streamguard_ocr_done(sg_ocr_result *result, void *user_data)
 	sg_ocr_free_result(result);
 }
 
-static void streamguard_build_mask(struct streamguard_filter *f)
+static void streamguard_build_mask(struct streamguard_filter *f, uint64_t now_ns)
 {
 	memset(f->mask_buf, 0, sizeof(f->mask_buf));
 	pthread_mutex_lock(&f->regions_mutex);
 	for (int i = 0; i < f->region_count; i++) {
 		struct sg_region *r = &f->regions[i];
-		int x0 = (int)(r->x * MASK_W);
-		int y0 = (int)(r->y * MASK_H);
-		int x1 = (int)((r->x + r->w) * MASK_W + 0.5f);
-		int y1 = (int)((r->y + r->h) * MASK_H + 0.5f);
+
+		/* Extrapolate region position using its smoothed velocity.
+		 * Covers the common case of scrolling / dragged text: between
+		 * OCR ticks (500ms) the bbox would otherwise lag behind the
+		 * actual text. Clamp age so an abandoned region doesn't shoot
+		 * off-screen and leave a trailing unblurred band. */
+		uint64_t age_ns = now_ns - r->last_seen_ns;
+		if (age_ns > MOTION_EXTRAP_MAX_NS)
+			age_ns = MOTION_EXTRAP_MAX_NS;
+		float age = (float)age_ns / 1.0e9f;
+		float cx = r->x + r->w * 0.5f + r->vx * age;
+		float cy = r->y + r->h * 0.5f + r->vy * age;
+		float rx = cx - r->w * 0.5f;
+		float ry = cy - r->h * 0.5f;
+
+		int x0 = (int)(rx * MASK_W);
+		int y0 = (int)(ry * MASK_H);
+		int x1 = (int)((rx + r->w) * MASK_W + 0.5f);
+		int y1 = (int)((ry + r->h) * MASK_H + 0.5f);
 		if (x0 < 0) x0 = 0;
 		if (y0 < 0) y0 = 0;
 		if (x1 > MASK_W) x1 = MASK_W;
@@ -347,8 +388,8 @@ static void streamguard_filter_video_render(void *data, gs_effect_t *effect)
 	/* 3. Expire regions older than TTL. */
 	streamguard_prune_regions(f, now);
 
-	/* 4. Rebuild the censor mask from current regions. */
-	streamguard_build_mask(f);
+	/* 4. Rebuild the censor mask from current regions (with motion extrapolation). */
+	streamguard_build_mask(f, now);
 	gs_texture_set_image(f->mask_tex, f->mask_buf, MASK_W, false);
 
 	/* Once a second: visibility into the pipeline state. */
