@@ -48,13 +48,13 @@ static void streamguard_ocr_done(sg_ocr_result *result, void *user_data)
 		if (f && f->detector && sg_detector_check(f->detector, b->text, &rule)) {
 			hits++;
 			obs_log(LOG_WARNING,
-				"[streamguard] SECRET frame=%llu rule=%s bbox=(%.2f,%.2f %.2fx%.2f) text=\"%s\"",
+				"SECRET frame=%llu rule=%s bbox=(%.2f,%.2f %.2fx%.2f) text=\"%s\"",
 				(unsigned long long)result->frame_id, rule ? rule : "?", b->x,
 				b->y, b->w, b->h, b->text);
 		}
 	}
 	if (hits > 0) {
-		obs_log(LOG_WARNING, "[streamguard] frame %llu: %d/%d boxes flagged",
+		obs_log(LOG_WARNING, "frame %llu: %d/%d boxes flagged",
 			(unsigned long long)result->frame_id, hits, result->count);
 	}
 	sg_ocr_free_result(result);

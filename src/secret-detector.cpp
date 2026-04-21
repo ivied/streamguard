@@ -45,8 +45,10 @@ std::vector<Rule> build_rules()
 	r.push_back({"basic_auth_url", std::regex(R"(https?://[^\s:@/]+:[^\s@/]+@)", ecma)});
 
 	// Russia-specific ----------------------------------------------------
-	// Passport (4 digits serial + 6 digits number, optional space/dash)
-	r.push_back({"ru_passport", std::regex(R"(\b\d{4}[ \-]?\d{6}\b)", ecma)});
+	// Passport: 4-digit serial + space/dash + 6-digit number. Separator is
+	// mandatory — without it any 10-digit substring (timestamp, ID, OCR
+	// noise) would match and the false-positive rate explodes.
+	r.push_back({"ru_passport", std::regex(R"(\b\d{4}[ \-]\d{6}\b)", ecma)});
 	// СНИЛС: 3-3-3 12 (space or dash before last two)
 	r.push_back({"ru_snils", std::regex(R"(\b\d{3}-\d{3}-\d{3}[ \-]\d{2}\b)", ecma)});
 
