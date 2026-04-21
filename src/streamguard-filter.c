@@ -21,15 +21,15 @@ model.
 #include "vision-ocr.h"
 #include "secret-detector.h"
 
-#define OCR_INTERVAL_NS_DEFAULT 500000000ULL    /* 500 ms = 2 Hz */
+#define OCR_INTERVAL_NS_DEFAULT 250000000ULL    /* 250 ms = 4 Hz */
 #define REGION_TTL_NS_DEFAULT   2500000000ULL   /* keep censor up 2.5s after last detect */
-#define REGION_PAD_PCT_DEFAULT  0.20f           /* extend each detection by 20% */
-/* Cap extrapolation so a stale region with old velocity doesn't slide across
- * the whole screen. Past this age we freeze the region in place. */
-#define MOTION_EXTRAP_MAX_NS    400000000ULL    /* 400 ms */
-/* Low-pass factor for velocity updates: new = α·measured + (1-α)·previous.
- * Low α = smoother but slower to react; high α = jumpy. */
-#define MOTION_VELOCITY_ALPHA   0.6f
+#define REGION_PAD_PCT_DEFAULT  0.30f           /* baseline padding: 30% on all sides */
+/* Age-based extra inflation: by the time a region hits this age (≈ OCR
+ * period), we've added AGE_INFLATION_MAX on top of the base padding on
+ * every side. Catches motion within the dead time between OCR ticks
+ * without having to predict direction — cheap and drift-free. */
+#define REGION_AGE_INFLATION_MAX 0.25f
+#define REGION_AGE_INFLATION_FULL_NS 300000000ULL
 #define MAX_REGIONS             64
 #define MASK_W                  320
 #define MASK_H                  180
@@ -44,7 +44,6 @@ model.
 
 struct sg_region {
 	float x, y, w, h; /* normalized UV, top-left origin */
-	float vx, vy;     /* UV units per second, EMA-smoothed */
 	uint64_t last_seen_ns;
 };
 
@@ -114,24 +113,7 @@ static void streamguard_add_region(struct streamguard_filter *f, float x, float 
 		float ax = fminf(r->x + r->w, x + w);
 		float ay = fminf(r->y + r->h, y + h);
 		if (ax > ix && ay > iy) {
-			/* Velocity from center-to-center motion since last sighting.
-			 * Updated via EMA so a single jittery OCR bbox doesn't fling
-			 * the extrapolated region across the screen. */
-			uint64_t dt_ns = now_ns - r->last_seen_ns;
-			if (dt_ns > 10000000ULL) { /* >10ms — ignore same-tick duplicates */
-				float dt = (float)dt_ns / 1.0e9f;
-				float old_cx = r->x + r->w * 0.5f;
-				float old_cy = r->y + r->h * 0.5f;
-				float new_cx = x + w * 0.5f;
-				float new_cy = y + h * 0.5f;
-				float meas_vx = (new_cx - old_cx) / dt;
-				float meas_vy = (new_cy - old_cy) / dt;
-				r->vx = MOTION_VELOCITY_ALPHA * meas_vx +
-					(1.0f - MOTION_VELOCITY_ALPHA) * r->vx;
-				r->vy = MOTION_VELOCITY_ALPHA * meas_vy +
-					(1.0f - MOTION_VELOCITY_ALPHA) * r->vy;
-			}
-			/* Union of new and old rects so neither escapes the censor. */
+			/* Union the rects so neither escapes the censor. */
 			float nx = fminf(r->x, x);
 			float ny = fminf(r->y, y);
 			r->w = fmaxf(r->x + r->w, x + w) - nx;
@@ -147,7 +129,6 @@ static void streamguard_add_region(struct streamguard_filter *f, float x, float 
 	if (f->region_count < MAX_REGIONS) {
 		struct sg_region *r = &f->regions[f->region_count++];
 		r->x = x; r->y = y; r->w = w; r->h = h;
-		r->vx = 0.0f; r->vy = 0.0f;
 		r->last_seen_ns = now_ns;
 	}
 	pthread_mutex_unlock(&f->regions_mutex);
@@ -203,24 +184,27 @@ static void streamguard_build_mask(struct streamguard_filter *f, uint64_t now_ns
 	for (int i = 0; i < f->region_count; i++) {
 		struct sg_region *r = &f->regions[i];
 
-		/* Extrapolate region position using its smoothed velocity.
-		 * Covers the common case of scrolling / dragged text: between
-		 * OCR ticks (500ms) the bbox would otherwise lag behind the
-		 * actual text. Clamp age so an abandoned region doesn't shoot
-		 * off-screen and leave a trailing unblurred band. */
+		/* Age-based inflation: as the region gets stale (approaching
+		 * the next OCR tick), grow it in all directions so fast
+		 * motion within the OCR dead time stays covered. This is a
+		 * no-prediction alternative to velocity extrapolation — less
+		 * precise but no drift / jitter. */
 		uint64_t age_ns = now_ns - r->last_seen_ns;
-		if (age_ns > MOTION_EXTRAP_MAX_NS)
-			age_ns = MOTION_EXTRAP_MAX_NS;
-		float age = (float)age_ns / 1.0e9f;
-		float cx = r->x + r->w * 0.5f + r->vx * age;
-		float cy = r->y + r->h * 0.5f + r->vy * age;
-		float rx = cx - r->w * 0.5f;
-		float ry = cy - r->h * 0.5f;
+		float age_factor = (float)age_ns / (float)REGION_AGE_INFLATION_FULL_NS;
+		if (age_factor > 1.0f) age_factor = 1.0f;
+		float inflate = age_factor * REGION_AGE_INFLATION_MAX;
+
+		float pad_w = r->w * inflate;
+		float pad_h = r->h * inflate;
+		float rx = r->x - pad_w;
+		float ry = r->y - pad_h;
+		float rw = r->w + 2.0f * pad_w;
+		float rh = r->h + 2.0f * pad_h;
 
 		int x0 = (int)(rx * MASK_W);
 		int y0 = (int)(ry * MASK_H);
-		int x1 = (int)((rx + r->w) * MASK_W + 0.5f);
-		int y1 = (int)((ry + r->h) * MASK_H + 0.5f);
+		int x1 = (int)((rx + rw) * MASK_W + 0.5f);
+		int y1 = (int)((ry + rh) * MASK_H + 0.5f);
 		if (x0 < 0) x0 = 0;
 		if (y0 < 0) y0 = 0;
 		if (x1 > MASK_W) x1 = MASK_W;
