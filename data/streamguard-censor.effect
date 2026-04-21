@@ -1,0 +1,52 @@
+// StreamGuard — censor shader.
+//
+// Renders the source untouched, except for rectangles listed in `boxes`
+// (normalized UV, top-left origin) which are painted solid black.
+// Box count is capped at 32; excess detections in a frame are skipped
+// in the caller rather than silently overflowing here.
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float4 boxes[32];
+uniform int box_count;
+
+sampler_state def_sampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertInOut {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertInOut VSDefault(VertInOut vert_in)
+{
+	VertInOut vert_out;
+	vert_out.pos = mul(float4(vert_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = vert_in.uv;
+	return vert_out;
+}
+
+float4 PSCensor(VertInOut vert_in) : TARGET
+{
+	float4 src = image.Sample(def_sampler, vert_in.uv);
+	for (int i = 0; i < box_count; i++) {
+		float4 b = boxes[i];
+		if (vert_in.uv.x >= b.x && vert_in.uv.x < b.x + b.z &&
+		    vert_in.uv.y >= b.y && vert_in.uv.y < b.y + b.w) {
+			return float4(0.0, 0.0, 0.0, src.a);
+		}
+	}
+	return src;
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(vert_in);
+		pixel_shader  = PSCensor(vert_in);
+	}
+}
