@@ -28,10 +28,13 @@ model.
 #define MASK_W                  320
 #define MASK_H                  180
 
-/* Ring size = delay + 1 so the slot being written is never the one being
- * sampled for output in the same tick (avoids WAR hazards on the GPU). */
-#define BUFFER_DELAY_FRAMES     30              /* ~500ms at 60fps */
-#define BUFFER_CAP              (BUFFER_DELAY_FRAMES + 1)
+/* Ring size = delay + 2. The +2 is load-bearing: we write first, then read
+ * in the same tick. With cap = delay + 1, the read slot and the just-written
+ * slot are identical after the first wrap, so "delayed" output = freshly
+ * captured pixels and the delay collapses to zero. The extra slot keeps
+ * write and read always pointing at different textures. */
+#define BUFFER_DELAY_FRAMES     45              /* ~750ms at 60fps */
+#define BUFFER_CAP              (BUFFER_DELAY_FRAMES + 2)
 
 struct sg_region {
 	float x, y, w, h; /* normalized UV, top-left origin */
