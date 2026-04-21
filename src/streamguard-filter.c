@@ -23,13 +23,7 @@ model.
 
 #define OCR_INTERVAL_NS_DEFAULT 250000000ULL    /* 250 ms = 4 Hz */
 #define REGION_TTL_NS_DEFAULT   2500000000ULL   /* keep censor up 2.5s after last detect */
-#define REGION_PAD_PCT_DEFAULT  0.30f           /* baseline padding: 30% on all sides */
-/* Age-based extra inflation: by the time a region hits this age (≈ OCR
- * period), we've added AGE_INFLATION_MAX on top of the base padding on
- * every side. Catches motion within the dead time between OCR ticks
- * without having to predict direction — cheap and drift-free. */
-#define REGION_AGE_INFLATION_MAX 0.25f
-#define REGION_AGE_INFLATION_FULL_NS 300000000ULL
+#define REGION_PAD_PCT_DEFAULT  0.20f           /* constant padding on every side */
 #define MAX_REGIONS             64
 #define MASK_W                  320
 #define MASK_H                  180
@@ -113,13 +107,16 @@ static void streamguard_add_region(struct streamguard_filter *f, float x, float 
 		float ax = fminf(r->x + r->w, x + w);
 		float ay = fminf(r->y + r->h, y + h);
 		if (ax > ix && ay > iy) {
-			/* Union the rects so neither escapes the censor. */
-			float nx = fminf(r->x, x);
-			float ny = fminf(r->y, y);
-			r->w = fmaxf(r->x + r->w, x + w) - nx;
-			r->h = fmaxf(r->y + r->h, y + h) - ny;
-			r->x = nx;
-			r->y = ny;
+			/* Replace — not union — the rect with the new detection.
+			 * Unioning caused visible swelling on static content as
+			 * successive OCR bboxes (jittering ±a few px) accumulated
+			 * into an ever-growing rect. Replacement snaps to the
+			 * latest bbox, which also happens to track scrolling text
+			 * with a lag of one OCR tick (≤250ms). */
+			r->x = x;
+			r->y = y;
+			r->w = w;
+			r->h = h;
 			r->last_seen_ns = now_ns;
 			pthread_mutex_unlock(&f->regions_mutex);
 			return;
@@ -179,32 +176,15 @@ static void streamguard_ocr_done(sg_ocr_result *result, void *user_data)
 
 static void streamguard_build_mask(struct streamguard_filter *f, uint64_t now_ns)
 {
+	UNUSED_PARAMETER(now_ns);
 	memset(f->mask_buf, 0, sizeof(f->mask_buf));
 	pthread_mutex_lock(&f->regions_mutex);
 	for (int i = 0; i < f->region_count; i++) {
 		struct sg_region *r = &f->regions[i];
-
-		/* Age-based inflation: as the region gets stale (approaching
-		 * the next OCR tick), grow it in all directions so fast
-		 * motion within the OCR dead time stays covered. This is a
-		 * no-prediction alternative to velocity extrapolation — less
-		 * precise but no drift / jitter. */
-		uint64_t age_ns = now_ns - r->last_seen_ns;
-		float age_factor = (float)age_ns / (float)REGION_AGE_INFLATION_FULL_NS;
-		if (age_factor > 1.0f) age_factor = 1.0f;
-		float inflate = age_factor * REGION_AGE_INFLATION_MAX;
-
-		float pad_w = r->w * inflate;
-		float pad_h = r->h * inflate;
-		float rx = r->x - pad_w;
-		float ry = r->y - pad_h;
-		float rw = r->w + 2.0f * pad_w;
-		float rh = r->h + 2.0f * pad_h;
-
-		int x0 = (int)(rx * MASK_W);
-		int y0 = (int)(ry * MASK_H);
-		int x1 = (int)((rx + rw) * MASK_W + 0.5f);
-		int y1 = (int)((ry + rh) * MASK_H + 0.5f);
+		int x0 = (int)(r->x * MASK_W);
+		int y0 = (int)(r->y * MASK_H);
+		int x1 = (int)((r->x + r->w) * MASK_W + 0.5f);
+		int y1 = (int)((r->y + r->h) * MASK_H + 0.5f);
 		if (x0 < 0) x0 = 0;
 		if (y0 < 0) y0 = 0;
 		if (x1 > MASK_W) x1 = MASK_W;
