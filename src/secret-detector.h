@@ -1,14 +1,24 @@
 /*
 StreamGuard — secret detector.
 
-Given a piece of text, returns whether it looks like a sensitive token
-(API key, password, private key material, РФ passport/СНИЛС, etc.) and
-which rule matched. Used to decide whether to blur an OCR bounding box.
+Two entry points:
+
+- sg_detector_check() — per-string check: regex patterns and Shannon
+  entropy. Stateless across calls.
+
+- sg_detector_check_all() — batch check over a full OCR frame. On top of
+  the per-string rules it runs a spatial pass: any short label box
+  containing a keyword like "password" / "пароль" / "token" marks the
+  neighbouring value box (same row, to the right) as a secret. This is
+  how we catch weak / unremarkable-looking passwords ("qwerty12345"):
+  by their context, not by their content.
 */
 
 #pragma once
 
 #include <stdbool.h>
+
+#include "vision-ocr.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,13 +29,16 @@ typedef struct sg_detector sg_detector;
 sg_detector *sg_detector_create(void);
 void sg_detector_destroy(sg_detector *d);
 
-/*
- * Returns true if `text` matches any enabled rule. When it does and
- * `matched_rule` is non-NULL, *matched_rule is set to a static C string
- * naming the rule (e.g. "aws_access_key", "shannon_entropy"). The pointer
- * is owned by the detector; do not free it.
- */
 bool sg_detector_check(sg_detector *d, const char *text, const char **matched_rule);
+
+/*
+ * Check all OCR boxes in one pass, filling `out_flags[i]` and `out_rules[i]`
+ * (each must point to an array of `count` elements). `out_rules[i]` gets
+ * a static string like "aws_access_key" / "label_proximity" owned by the
+ * detector — do not free.
+ */
+void sg_detector_check_all(sg_detector *d, const sg_ocr_box *boxes, int count,
+			   bool *out_flags, const char **out_rules);
 
 #ifdef __cplusplus
 }

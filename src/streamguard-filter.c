@@ -158,26 +158,38 @@ static void streamguard_ocr_done(sg_ocr_result *result, void *user_data)
 		return;
 
 	uint64_t now = os_gettime_ns();
-	int hits = 0;
-	for (int i = 0; i < result->count; i++) {
-		sg_ocr_box *b = &result->boxes[i];
-		const char *rule = NULL;
-		if (f && f->detector && sg_detector_check(f->detector, b->text, &rule)) {
+
+	if (f && f->detector && result->count > 0) {
+		bool *flags = bzalloc(sizeof(bool) * (size_t)result->count);
+		const char **rules =
+			bzalloc(sizeof(const char *) * (size_t)result->count);
+		sg_detector_check_all(f->detector, result->boxes, result->count, flags,
+				      rules);
+
+		int hits = 0;
+		for (int i = 0; i < result->count; i++) {
+			if (!flags[i])
+				continue;
 			hits++;
+			sg_ocr_box *b = &result->boxes[i];
 			/* Vision bottom-left → UV top-left */
 			float uv_x = b->x;
 			float uv_y = 1.0f - b->y - b->h;
 			streamguard_add_region(f, uv_x, uv_y, b->w, b->h, now);
 			obs_log(LOG_WARNING,
 				"SECRET frame=%llu rule=%s bbox=(%.2f,%.2f %.2fx%.2f) text=\"%s\"",
-				(unsigned long long)result->frame_id, rule ? rule : "?", b->x,
-				b->y, b->w, b->h, b->text);
+				(unsigned long long)result->frame_id,
+				rules[i] ? rules[i] : "?", b->x, b->y, b->w, b->h, b->text);
 		}
+		if (hits > 0) {
+			obs_log(LOG_WARNING, "frame %llu: %d/%d boxes flagged",
+				(unsigned long long)result->frame_id, hits, result->count);
+		}
+
+		bfree(flags);
+		bfree(rules);
 	}
-	if (hits > 0) {
-		obs_log(LOG_WARNING, "frame %llu: %d/%d boxes flagged",
-			(unsigned long long)result->frame_id, hits, result->count);
-	}
+
 	sg_ocr_free_result(result);
 }
 

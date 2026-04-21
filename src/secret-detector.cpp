@@ -9,6 +9,7 @@ toward catching more, not less.
 
 #include "secret-detector.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <regex>
@@ -24,7 +25,6 @@ struct Rule {
 
 std::vector<Rule> build_rules()
 {
-	// std::regex::ECMAScript + case-sensitive unless noted.
 	std::vector<Rule> r;
 	const auto ecma = std::regex::ECMAScript | std::regex::optimize;
 
@@ -45,17 +45,12 @@ std::vector<Rule> build_rules()
 	r.push_back({"basic_auth_url", std::regex(R"(https?://[^\s:@/]+:[^\s@/]+@)", ecma)});
 
 	// Russia-specific ----------------------------------------------------
-	// Passport: 4-digit serial + space/dash + 6-digit number. Separator is
-	// mandatory — without it any 10-digit substring (timestamp, ID, OCR
-	// noise) would match and the false-positive rate explodes.
 	r.push_back({"ru_passport", std::regex(R"(\b\d{4}[ \-]\d{6}\b)", ecma)});
-	// СНИЛС: 3-3-3 12 (space or dash before last two)
 	r.push_back({"ru_snils", std::regex(R"(\b\d{3}-\d{3}-\d{3}[ \-]\d{2}\b)", ecma)});
 
 	return r;
 }
 
-// Shannon entropy in bits per character over the printable payload.
 double shannon_entropy(const std::string &s)
 {
 	if (s.empty())
@@ -74,9 +69,6 @@ double shannon_entropy(const std::string &s)
 	return H;
 }
 
-// Return the "densest" token: longest contiguous run of non-space characters.
-// We run entropy only on that, not the whole phrase (`const x = "..."` has
-// low entropy overall even if the literal inside is high-entropy).
 std::string densest_token(const std::string &s)
 {
 	std::string best;
@@ -96,16 +88,144 @@ std::string densest_token(const std::string &s)
 	return best;
 }
 
+std::string to_lower(const std::string &s)
+{
+	std::string out(s);
+	std::transform(out.begin(), out.end(), out.begin(),
+		       [](unsigned char c) { return (char)std::tolower(c); });
+	return out;
+}
+
+// Does a short-ish OCR string look like a field label for a secret value?
+// We check a lower-cased copy against a small list of keywords. We cap
+// length at 40 chars to avoid matching prose that happens to contain
+// "password" (e.g. "reset your password via email").
+bool is_secret_label(const std::string &text)
+{
+	if (text.empty() || text.size() > 40)
+		return false;
+	const std::string t = to_lower(text);
+
+	// Latin
+	static const char *latin[] = {
+		"password", "passwd", "pwd", "pass:", "pass ",
+		"secret",   "token",  "api key", "api_key",
+		"apikey",   "access key", "access_key", "accesskey",
+		"private key", "privkey", "credential", "credentials",
+		"seed phrase", "recovery phrase", "recovery key",
+		"pin code", "pin:",
+	};
+	for (const char *kw : latin) {
+		if (t.find(kw) != std::string::npos)
+			return true;
+	}
+
+	// Russian keywords — check against the ORIGINAL (utf-8 lowered isn't
+	// reliable for Cyrillic via std::tolower, which only touches ASCII).
+	static const char *ru[] = {
+		"пароль", "Пароль", "ПАРОЛЬ",
+		"секрет", "Секрет", "СЕКРЕТ",
+		"ключ",   "Ключ",   "КЛЮЧ",
+		"пин",    "Пин",    "ПИН",
+		"токен",  "Токен",  "ТОКЕН",
+	};
+	for (const char *kw : ru) {
+		if (text.find(kw) != std::string::npos)
+			return true;
+	}
+
+	return false;
+}
+
+// A box worth blurring as a label's neighbour — not just whitespace, not
+// itself a label, not a single short token like ":" or "—".
+bool is_plausible_value(const std::string &text)
+{
+	if (text.size() < 3)
+		return false;
+	int non_space = 0;
+	for (char c : text) {
+		if (c != ' ' && c != '\t')
+			non_space++;
+	}
+	return non_space >= 3 && !is_secret_label(text);
+}
+
+struct Box {
+	float x, y, w, h; // Vision bottom-left-origin, normalized
+};
+
+bool vertical_overlap(const Box &a, const Box &b, float min_frac)
+{
+	float top_a = a.y + a.h;
+	float top_b = b.y + b.h;
+	float ov_lo = std::max(a.y, b.y);
+	float ov_hi = std::min(top_a, top_b);
+	float ov = ov_hi - ov_lo;
+	if (ov <= 0.0f)
+		return false;
+	float min_h = std::min(a.h, b.h);
+	return ov >= min_h * min_frac;
+}
+
+bool horizontal_overlap(const Box &a, const Box &b, float min_frac)
+{
+	float right_a = a.x + a.w;
+	float right_b = b.x + b.w;
+	float ov_lo = std::max(a.x, b.x);
+	float ov_hi = std::min(right_a, right_b);
+	float ov = ov_hi - ov_lo;
+	if (ov <= 0.0f)
+		return false;
+	float min_w = std::min(a.w, b.w);
+	return ov >= min_w * min_frac;
+}
+
+// Candidate `c` is adjacent to label `l` in one of three patterns typical
+// of forms / password manager detail views:
+//   - same row, to the right of the label
+//   - directly below the label (label on top of field)
+//   - directly above the label (field over its caption)
+//
+// All measured in Vision bottom-left coordinates: smaller y = visually
+// lower, bigger y = visually higher.
+bool is_adjacent_to_label(const Box &l, const Box &c)
+{
+	// Case 1: same-row / right-of
+	if (vertical_overlap(l, c, 0.3f) && c.x >= l.x + l.w * 0.3f &&
+	    c.x <= l.x + l.w + 0.4f) {
+		return true;
+	}
+
+	const float max_vertical_gap = std::max(l.h, c.h) * 3.0f;
+
+	// Case 2: candidate directly below label (c.y + c.h ≤ l.y)
+	if (c.y + c.h <= l.y &&
+	    (l.y - (c.y + c.h)) <= max_vertical_gap &&
+	    horizontal_overlap(l, c, 0.2f)) {
+		return true;
+	}
+
+	// Case 3: candidate directly above label (c.y ≥ l.y + l.h)
+	if (c.y >= l.y + l.h &&
+	    (c.y - (l.y + l.h)) <= max_vertical_gap &&
+	    horizontal_overlap(l, c, 0.2f)) {
+		return true;
+	}
+
+	return false;
+}
+
 } // namespace
 
 struct sg_detector {
 	std::vector<Rule> rules;
-	// Shannon threshold in bits/char. 4.5 is roughly the cutoff where
-	// base64/hex/random identifiers live; English words sit around 3.5–4.0.
 	double entropy_threshold = 4.5;
-	// Minimum token length to even consider for entropy — below this,
-	// short random-looking English words cause too many false positives.
-	size_t entropy_min_len = 20;
+	// Dropped from 20 to 14: catches password-manager-generated strings
+	// like "arj3fkx_ezn3CWE3tur" (length 19) that were previously below
+	// the threshold. Accepts some extra false positives on normal code
+	// identifiers as the cost.
+	size_t entropy_min_len = 14;
 };
 
 extern "C" sg_detector *sg_detector_create(void)
@@ -146,4 +266,39 @@ extern "C" bool sg_detector_check(sg_detector *d, const char *text, const char *
 	}
 
 	return false;
+}
+
+extern "C" void sg_detector_check_all(sg_detector *d, const sg_ocr_box *boxes, int count,
+				      bool *out_flags, const char **out_rules)
+{
+	if (!d || !boxes || !out_flags || !out_rules || count <= 0)
+		return;
+
+	// Pass 1: per-string rules.
+	for (int i = 0; i < count; i++) {
+		out_flags[i] = false;
+		out_rules[i] = NULL;
+		if (sg_detector_check(d, boxes[i].text, &out_rules[i])) {
+			out_flags[i] = true;
+		}
+	}
+
+	// Pass 2: spatial label proximity. For every label, mark any
+	// plausible-value neighbour as a secret if it isn't already flagged.
+	for (int i = 0; i < count; i++) {
+		if (!is_secret_label(boxes[i].text))
+			continue;
+		Box lb{boxes[i].x, boxes[i].y, boxes[i].w, boxes[i].h};
+		for (int j = 0; j < count; j++) {
+			if (j == i || out_flags[j])
+				continue;
+			if (!is_plausible_value(boxes[j].text))
+				continue;
+			Box cb{boxes[j].x, boxes[j].y, boxes[j].w, boxes[j].h};
+			if (is_adjacent_to_label(lb, cb)) {
+				out_flags[j] = true;
+				out_rules[j] = "label_proximity";
+			}
+		}
+	}
 }
