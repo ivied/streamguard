@@ -34,6 +34,25 @@ if(ENABLE_QT)
   )
 endif()
 
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c src/streamguard-filter.c)
+target_sources(
+  ${CMAKE_PROJECT_NAME}
+  PRIVATE src/plugin-main.c src/streamguard-filter.c src/vision-ocr.mm
+)
+
+if(APPLE)
+  target_link_libraries(
+    ${CMAKE_PROJECT_NAME}
+    PRIVATE
+      "-framework Foundation"
+      "-framework CoreFoundation"
+      "-framework CoreVideo"
+      "-framework CoreGraphics"
+      "-framework Vision"
+  )
+  set_source_files_properties(
+    src/vision-ocr.mm
+    PROPERTIES COMPILE_FLAGS "-fobjc-arc -fno-objc-arc-exceptions"
+  )
+endif()
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
