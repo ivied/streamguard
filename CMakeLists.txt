@@ -36,7 +36,7 @@ endif()
 
 target_sources(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE src/plugin-main.c src/streamguard-filter.c src/vision-ocr.mm
+  PRIVATE src/plugin-main.c src/streamguard-filter.c src/vision-ocr.mm src/secret-detector.cpp
 )
 
 if(APPLE)

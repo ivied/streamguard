@@ -10,6 +10,7 @@ Blur/detection pipeline is layered on top in later steps.
 #include <util/threading.h>
 
 #include "vision-ocr.h"
+#include "secret-detector.h"
 
 #define OCR_INTERVAL_NS_DEFAULT 500000000ULL /* 500 ms = 2 Hz */
 
@@ -22,6 +23,7 @@ struct streamguard_filter {
 	uint32_t stage_h;
 
 	sg_ocr_ctx *ocr;
+	sg_detector *detector;
 	uint64_t ocr_interval_ns;
 	uint64_t last_ocr_ns;
 	uint64_t next_frame_id;
@@ -35,15 +37,25 @@ static const char *streamguard_filter_get_name(void *unused)
 
 static void streamguard_ocr_done(sg_ocr_result *result, void *user_data)
 {
-	UNUSED_PARAMETER(user_data);
+	struct streamguard_filter *f = user_data;
 	if (!result)
 		return;
-	obs_log(LOG_INFO, "OCR frame %llu: %d boxes", (unsigned long long)result->frame_id,
-		result->count);
-	for (int i = 0; i < result->count && i < 5; i++) {
+
+	int hits = 0;
+	for (int i = 0; i < result->count; i++) {
 		sg_ocr_box *b = &result->boxes[i];
-		obs_log(LOG_INFO, "  [%d] conf=%.2f bbox=(%.2f,%.2f %.2fx%.2f) text=\"%s\"", i,
-			b->confidence, b->x, b->y, b->w, b->h, b->text);
+		const char *rule = NULL;
+		if (f && f->detector && sg_detector_check(f->detector, b->text, &rule)) {
+			hits++;
+			obs_log(LOG_WARNING,
+				"[streamguard] SECRET frame=%llu rule=%s bbox=(%.2f,%.2f %.2fx%.2f) text=\"%s\"",
+				(unsigned long long)result->frame_id, rule ? rule : "?", b->x,
+				b->y, b->w, b->h, b->text);
+		}
+	}
+	if (hits > 0) {
+		obs_log(LOG_WARNING, "[streamguard] frame %llu: %d/%d boxes flagged",
+			(unsigned long long)result->frame_id, hits, result->count);
 	}
 	sg_ocr_free_result(result);
 }
@@ -62,6 +74,7 @@ static void *streamguard_filter_create(obs_data_t *settings, obs_source_t *sourc
 	obs_leave_graphics();
 
 	f->ocr = sg_ocr_create();
+	f->detector = sg_detector_create();
 	return f;
 }
 
@@ -74,6 +87,10 @@ static void streamguard_filter_destroy(void *data)
 	if (f->ocr) {
 		sg_ocr_destroy(f->ocr);
 		f->ocr = NULL;
+	}
+	if (f->detector) {
+		sg_detector_destroy(f->detector);
+		f->detector = NULL;
 	}
 
 	obs_enter_graphics();
