@@ -9,6 +9,7 @@ detected regions with solid black rectangles via streamguard-censor.effect.
 #include <util/platform.h>
 #include <util/threading.h>
 #include <pthread.h>
+#include <string.h>
 
 #include "vision-ocr.h"
 #include "secret-detector.h"
@@ -16,7 +17,9 @@ detected regions with solid black rectangles via streamguard-censor.effect.
 #define OCR_INTERVAL_NS_DEFAULT 500000000ULL    /* 500 ms = 2 Hz */
 #define REGION_TTL_NS_DEFAULT   1500000000ULL   /* keep censor up 1.5s after last detect */
 #define REGION_PAD_PCT_DEFAULT  0.10f           /* extend each detection by 10% of its size */
-#define MAX_REGIONS             32
+#define MAX_REGIONS             64
+#define MASK_W                  320
+#define MASK_H                  180
 
 struct sg_region {
 	float x, y, w, h; /* normalized UV, top-left origin */
@@ -38,8 +41,10 @@ struct streamguard_filter {
 	uint64_t next_frame_id;
 
 	gs_effect_t *censor_effect;
-	gs_eparam_t *param_boxes;
-	gs_eparam_t *param_box_count;
+	gs_eparam_t *param_mask;
+
+	gs_texture_t *mask_tex;
+	uint8_t mask_buf[MASK_W * MASK_H];
 
 	pthread_mutex_t regions_mutex;
 	struct sg_region regions[MAX_REGIONS];
@@ -150,6 +155,28 @@ static void streamguard_ocr_done(sg_ocr_result *result, void *user_data)
 	sg_ocr_free_result(result);
 }
 
+static void streamguard_build_mask(struct streamguard_filter *f)
+{
+	memset(f->mask_buf, 0, sizeof(f->mask_buf));
+
+	pthread_mutex_lock(&f->regions_mutex);
+	for (int i = 0; i < f->region_count; i++) {
+		struct sg_region *r = &f->regions[i];
+		int x0 = (int)(r->x * MASK_W);
+		int y0 = (int)(r->y * MASK_H);
+		int x1 = (int)((r->x + r->w) * MASK_W + 0.5f);
+		int y1 = (int)((r->y + r->h) * MASK_H + 0.5f);
+		if (x0 < 0) x0 = 0;
+		if (y0 < 0) y0 = 0;
+		if (x1 > MASK_W) x1 = MASK_W;
+		if (y1 > MASK_H) y1 = MASK_H;
+		for (int y = y0; y < y1; y++) {
+			memset(&f->mask_buf[y * MASK_W + x0], 0xFF, (size_t)(x1 - x0));
+		}
+	}
+	pthread_mutex_unlock(&f->regions_mutex);
+}
+
 static void *streamguard_filter_create(obs_data_t *settings, obs_source_t *source)
 {
 	UNUSED_PARAMETER(settings);
@@ -170,11 +197,14 @@ static void *streamguard_filter_create(obs_data_t *settings, obs_source_t *sourc
 		bfree(effect_path);
 	}
 	if (f->censor_effect) {
-		f->param_boxes = gs_effect_get_param_by_name(f->censor_effect, "boxes");
-		f->param_box_count = gs_effect_get_param_by_name(f->censor_effect, "box_count");
+		f->param_mask = gs_effect_get_param_by_name(f->censor_effect, "mask");
+		obs_log(LOG_INFO, "censor effect loaded: mask_param=%p",
+			(void *)f->param_mask);
 	} else {
 		obs_log(LOG_ERROR, "failed to load streamguard-censor.effect");
 	}
+	const uint8_t *ptrs[1] = {f->mask_buf};
+	f->mask_tex = gs_texture_create(MASK_W, MASK_H, GS_R8, 1, ptrs, GS_DYNAMIC);
 	obs_leave_graphics();
 
 	f->ocr = sg_ocr_create();
@@ -205,6 +235,10 @@ static void streamguard_filter_destroy(void *data)
 	if (f->texrender) {
 		gs_texrender_destroy(f->texrender);
 		f->texrender = NULL;
+	}
+	if (f->mask_tex) {
+		gs_texture_destroy(f->mask_tex);
+		f->mask_tex = NULL;
 	}
 	if (f->censor_effect) {
 		gs_effect_destroy(f->censor_effect);
@@ -280,31 +314,36 @@ static void streamguard_filter_video_render(void *data, gs_effect_t *effect)
 
 	streamguard_prune_regions(f, now);
 
-	if (!f->censor_effect) {
+	if (!f->censor_effect || !f->mask_tex) {
 		obs_source_skip_video_filter(f->source);
 		return;
 	}
 
-	/* Snapshot regions for the shader. */
-	struct vec4 boxes[MAX_REGIONS];
-	int box_count;
-	pthread_mutex_lock(&f->regions_mutex);
-	box_count = f->region_count;
-	for (int i = 0; i < box_count; i++) {
-		boxes[i].x = f->regions[i].x;
-		boxes[i].y = f->regions[i].y;
-		boxes[i].z = f->regions[i].w;
-		boxes[i].w = f->regions[i].h;
-	}
-	pthread_mutex_unlock(&f->regions_mutex);
+	streamguard_build_mask(f);
+	gs_texture_set_image(f->mask_tex, f->mask_buf, MASK_W, false);
 
-	if (!obs_source_process_filter_begin(f->source, GS_RGBA, OBS_ALLOW_DIRECT_RENDERING))
+	/* Once a second: what does the render path see? */
+	static uint64_t s_last_diag_ns = 0;
+	if (now - s_last_diag_ns > 1000000000ULL) {
+		s_last_diag_ns = now;
+		pthread_mutex_lock(&f->regions_mutex);
+		int rc = f->region_count;
+		float rx = rc > 0 ? f->regions[0].x : 0.0f;
+		float ry = rc > 0 ? f->regions[0].y : 0.0f;
+		float rw = rc > 0 ? f->regions[0].w : 0.0f;
+		float rh = rc > 0 ? f->regions[0].h : 0.0f;
+		pthread_mutex_unlock(&f->regions_mutex);
+		obs_log(LOG_INFO,
+			"render: regions=%d first=(%.2f,%.2f %.2fx%.2f) effect=%p mask=%p",
+			rc, rx, ry, rw, rh, (void *)f->censor_effect,
+			(void *)f->mask_tex);
+	}
+
+	if (!obs_source_process_filter_begin(f->source, GS_RGBA, OBS_NO_DIRECT_RENDERING))
 		return;
 
-	if (f->param_boxes)
-		gs_effect_set_val(f->param_boxes, boxes, sizeof(struct vec4) * MAX_REGIONS);
-	if (f->param_box_count)
-		gs_effect_set_int(f->param_box_count, box_count);
+	if (f->param_mask)
+		gs_effect_set_texture(f->param_mask, f->mask_tex);
 
 	obs_source_process_filter_end(f->source, f->censor_effect,
 				      obs_source_get_base_width(f->source),

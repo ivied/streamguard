@@ -1,16 +1,21 @@
 // StreamGuard — censor shader.
 //
-// Renders the source untouched, except for rectangles listed in `boxes`
-// (normalized UV, top-left origin) which are painted solid black.
-// Box count is capped at 32; excess detections in a frame are skipped
-// in the caller rather than silently overflowing here.
+// `image` is the filtered source (provided by OBS).
+// `mask` is a low-res R8 texture we build on the CPU — white pixels
+// mark regions to censor. Shader outputs solid black wherever the mask
+// samples > 0.5, and the unchanged source everywhere else.
 
 uniform float4x4 ViewProj;
 uniform texture2d image;
-uniform float4 boxes[32];
-uniform int box_count;
+uniform texture2d mask;
 
 sampler_state def_sampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+sampler_state mask_sampler {
 	Filter   = Linear;
 	AddressU = Clamp;
 	AddressV = Clamp;
@@ -32,12 +37,9 @@ VertInOut VSDefault(VertInOut vert_in)
 float4 PSCensor(VertInOut vert_in) : TARGET
 {
 	float4 src = image.Sample(def_sampler, vert_in.uv);
-	for (int i = 0; i < box_count; i++) {
-		float4 b = boxes[i];
-		if (vert_in.uv.x >= b.x && vert_in.uv.x < b.x + b.z &&
-		    vert_in.uv.y >= b.y && vert_in.uv.y < b.y + b.w) {
-			return float4(0.0, 0.0, 0.0, src.a);
-		}
+	float m = mask.Sample(mask_sampler, vert_in.uv).r;
+	if (m > 0.5) {
+		return float4(0.0, 0.0, 0.0, src.a);
 	}
 	return src;
 }
