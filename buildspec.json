@@ -1,0 +1,31 @@
+{
+    "dependencies": {
+        "obs-studio": {
+            "version": "31.1.1",
+            "baseUrl": "https://github.com/obsproject/obs-studio/archive/refs/tags",
+            "label": "OBS sources",
+            "hashes": {
+                "macos": "39751f067bacc13d44b116c5138491b5f1391f91516d3d590d874edd21292291"
+            }
+        },
+        "prebuilt": {
+            "version": "2025-07-11",
+            "baseUrl": "https://github.com/obsproject/obs-deps/releases/download",
+            "label": "Pre-Built obs-deps",
+            "hashes": {
+                "macos": "495687e63383d1a287684b6e2e9bfe246bb8f156fe265926afb1a325af1edd2a"
+            }
+        }
+    },
+    "platformConfig": {
+        "macos": {
+            "bundleId": "com.sergeykurdyuk.streamguard"
+        }
+    },
+    "name": "streamguard",
+    "displayName": "StreamGuard",
+    "version": "0.1.0",
+    "author": "Sergey Kurdyuk",
+    "website": "https://github.com/sudorous/streamguard",
+    "email": "sudorous@gmail.com"
+}
