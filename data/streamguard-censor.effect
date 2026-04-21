@@ -1,9 +1,17 @@
 // StreamGuard — censor shader.
 //
-// `image` is the filtered source (provided by OBS).
-// `mask` is a low-res R8 texture we build on the CPU — white pixels
-// mark regions to censor. Shader outputs solid black wherever the mask
-// samples > 0.5, and the unchanged source everywhere else.
+// Single-pass disc blur, 13 taps (center + 8 inner ring + 4 outer axis).
+// Each tap is unrolled — OBS's HLSL→GLSL translator has historically
+// tripped over dynamic array indexing in shaders, so we keep everything
+// constant-addressed.
+//
+// Strength is a compile-time radius in UV space. At 1.5% UV ≈ 16px per
+// 1080p row, which reliably kills per-character legibility for typical
+// ~1% UV text height.
+//
+// The mask is sampled with linear filtering, so its edges already fade
+// 0→255 across the boundary of a region. We use that as a lerp factor
+// (src → blurred) which gives naturally feathered edges "for free".
 
 uniform float4x4 ViewProj;
 uniform texture2d image;
@@ -38,10 +46,32 @@ float4 PSCensor(VertInOut vert_in) : TARGET
 {
 	float4 src = image.Sample(def_sampler, vert_in.uv);
 	float m = mask.Sample(mask_sampler, vert_in.uv).r;
-	if (m > 0.5) {
-		return float4(0.0, 0.0, 0.0, src.a);
+
+	if (m <= 0.001) {
+		return src;
 	}
-	return src;
+
+	float r = 0.015;
+	float d = r * 0.7071;
+
+	float4 acc = src;
+	// Inner ring — 8 samples at radius r
+	acc += image.Sample(def_sampler, vert_in.uv + float2( r, 0.0));
+	acc += image.Sample(def_sampler, vert_in.uv + float2(-r, 0.0));
+	acc += image.Sample(def_sampler, vert_in.uv + float2(0.0,  r));
+	acc += image.Sample(def_sampler, vert_in.uv + float2(0.0, -r));
+	acc += image.Sample(def_sampler, vert_in.uv + float2( d,  d));
+	acc += image.Sample(def_sampler, vert_in.uv + float2(-d,  d));
+	acc += image.Sample(def_sampler, vert_in.uv + float2( d, -d));
+	acc += image.Sample(def_sampler, vert_in.uv + float2(-d, -d));
+	// Outer ring — 4 samples at radius 2r (axis-aligned)
+	acc += image.Sample(def_sampler, vert_in.uv + float2( 2.0 * r, 0.0));
+	acc += image.Sample(def_sampler, vert_in.uv + float2(-2.0 * r, 0.0));
+	acc += image.Sample(def_sampler, vert_in.uv + float2(0.0,  2.0 * r));
+	acc += image.Sample(def_sampler, vert_in.uv + float2(0.0, -2.0 * r));
+	float4 blurred = acc / 13.0;
+
+	return src * (1.0 - m) + blurred * m;
 }
 
 technique Draw
