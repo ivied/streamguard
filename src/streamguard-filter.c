@@ -1,7 +1,14 @@
 /*
-StreamGuard filter — video filter that periodically reads back frames from
-the GPU, runs Apple Vision OCR on them, detects secrets, and censors the
-detected regions with solid black rectangles via streamguard-censor.effect.
+StreamGuard filter — video filter that buffers frames, runs Apple Vision
+OCR on the freshest frame each tick, detects secrets, and outputs delayed
+frames with censor mask applied.
+
+The frame buffer (ring of N+1 texrenders) is the key trick: we output a
+frame that was sampled ~30 ticks ago, so by the time it reaches the
+encoder, OCR has already inspected it and our region list reflects its
+contents. Without the buffer, a newly appearing secret would be visible
+on stream for 100–600ms until OCR caught up — unsafe for the threat
+model.
 */
 
 #include <obs-module.h>
@@ -16,10 +23,15 @@ detected regions with solid black rectangles via streamguard-censor.effect.
 
 #define OCR_INTERVAL_NS_DEFAULT 500000000ULL    /* 500 ms = 2 Hz */
 #define REGION_TTL_NS_DEFAULT   1500000000ULL   /* keep censor up 1.5s after last detect */
-#define REGION_PAD_PCT_DEFAULT  0.10f           /* extend each detection by 10% of its size */
+#define REGION_PAD_PCT_DEFAULT  0.10f
 #define MAX_REGIONS             64
 #define MASK_W                  320
 #define MASK_H                  180
+
+/* Ring size = delay + 1 so the slot being written is never the one being
+ * sampled for output in the same tick (avoids WAR hazards on the GPU). */
+#define BUFFER_DELAY_FRAMES     30              /* ~500ms at 60fps */
+#define BUFFER_CAP              (BUFFER_DELAY_FRAMES + 1)
 
 struct sg_region {
 	float x, y, w, h; /* normalized UV, top-left origin */
@@ -29,7 +41,14 @@ struct sg_region {
 struct streamguard_filter {
 	obs_source_t *source;
 
-	gs_texrender_t *texrender;
+	/* Delay ring: each slot holds one captured source frame. */
+	gs_texrender_t *ring[BUFFER_CAP];
+	uint32_t ring_w;
+	uint32_t ring_h;
+	int write_idx;
+	int read_idx;
+	int items;
+
 	gs_stagesurf_t *stagesurface;
 	uint32_t stage_w;
 	uint32_t stage_h;
@@ -41,6 +60,7 @@ struct streamguard_filter {
 	uint64_t next_frame_id;
 
 	gs_effect_t *censor_effect;
+	gs_eparam_t *param_image;
 	gs_eparam_t *param_mask;
 
 	gs_texture_t *mask_tex;
@@ -62,7 +82,6 @@ static const char *streamguard_filter_get_name(void *unused)
 static void streamguard_add_region(struct streamguard_filter *f, float x, float y, float w, float h,
 				   uint64_t now_ns)
 {
-	/* Pad the box so letters at the edges don't peek out of the censor. */
 	float pad_w = w * f->region_pad_pct;
 	float pad_h = h * f->region_pad_pct;
 	x -= pad_w;
@@ -78,9 +97,6 @@ static void streamguard_add_region(struct streamguard_filter *f, float x, float 
 
 	pthread_mutex_lock(&f->regions_mutex);
 
-	/* Merge if the new rect substantially overlaps an existing one —
-	 * otherwise the array fills quickly with near-duplicates when OCR
-	 * re-detects the same text frame after frame. */
 	for (int i = 0; i < f->region_count; i++) {
 		struct sg_region *r = &f->regions[i];
 		float ix = fmaxf(r->x, x);
@@ -88,7 +104,6 @@ static void streamguard_add_region(struct streamguard_filter *f, float x, float 
 		float ax = fminf(r->x + r->w, x + w);
 		float ay = fminf(r->y + r->h, y + h);
 		if (ax > ix && ay > iy) {
-			/* Expand to union so neither detection escapes the censor. */
 			float nx = fminf(r->x, x);
 			float ny = fminf(r->y, y);
 			r->w = fmaxf(r->x + r->w, x + w) - nx;
@@ -103,10 +118,7 @@ static void streamguard_add_region(struct streamguard_filter *f, float x, float 
 
 	if (f->region_count < MAX_REGIONS) {
 		struct sg_region *r = &f->regions[f->region_count++];
-		r->x = x;
-		r->y = y;
-		r->w = w;
-		r->h = h;
+		r->x = x; r->y = y; r->w = w; r->h = h;
 		r->last_seen_ns = now_ns;
 	}
 	pthread_mutex_unlock(&f->regions_mutex);
@@ -138,7 +150,7 @@ static void streamguard_ocr_done(sg_ocr_result *result, void *user_data)
 		const char *rule = NULL;
 		if (f && f->detector && sg_detector_check(f->detector, b->text, &rule)) {
 			hits++;
-			/* Vision: bottom-left origin. UV: top-left. Flip Y. */
+			/* Vision bottom-left → UV top-left */
 			float uv_x = b->x;
 			float uv_y = 1.0f - b->y - b->h;
 			streamguard_add_region(f, uv_x, uv_y, b->w, b->h, now);
@@ -158,7 +170,6 @@ static void streamguard_ocr_done(sg_ocr_result *result, void *user_data)
 static void streamguard_build_mask(struct streamguard_filter *f)
 {
 	memset(f->mask_buf, 0, sizeof(f->mask_buf));
-
 	pthread_mutex_lock(&f->regions_mutex);
 	for (int i = 0; i < f->region_count; i++) {
 		struct sg_region *r = &f->regions[i];
@@ -183,23 +194,24 @@ static void *streamguard_filter_create(obs_data_t *settings, obs_source_t *sourc
 	struct streamguard_filter *f = bzalloc(sizeof(struct streamguard_filter));
 	f->source = source;
 	f->ocr_interval_ns = OCR_INTERVAL_NS_DEFAULT;
-	f->last_ocr_ns = 0;
-	f->next_frame_id = 0;
 	f->region_ttl_ns = REGION_TTL_NS_DEFAULT;
 	f->region_pad_pct = REGION_PAD_PCT_DEFAULT;
 	pthread_mutex_init(&f->regions_mutex, NULL);
 
 	obs_enter_graphics();
-	f->texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+	for (int i = 0; i < BUFFER_CAP; i++) {
+		f->ring[i] = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+	}
 	char *effect_path = obs_module_file("streamguard-censor.effect");
 	if (effect_path) {
 		f->censor_effect = gs_effect_create_from_file(effect_path, NULL);
 		bfree(effect_path);
 	}
 	if (f->censor_effect) {
+		f->param_image = gs_effect_get_param_by_name(f->censor_effect, "image");
 		f->param_mask = gs_effect_get_param_by_name(f->censor_effect, "mask");
-		obs_log(LOG_INFO, "censor effect loaded: mask_param=%p",
-			(void *)f->param_mask);
+		obs_log(LOG_INFO, "censor effect loaded: image=%p mask=%p",
+			(void *)f->param_image, (void *)f->param_mask);
 	} else {
 		obs_log(LOG_ERROR, "failed to load streamguard-censor.effect");
 	}
@@ -218,86 +230,86 @@ static void streamguard_filter_destroy(void *data)
 	if (!f)
 		return;
 
-	if (f->ocr) {
-		sg_ocr_destroy(f->ocr);
-		f->ocr = NULL;
-	}
-	if (f->detector) {
-		sg_detector_destroy(f->detector);
-		f->detector = NULL;
-	}
+	if (f->ocr) { sg_ocr_destroy(f->ocr); f->ocr = NULL; }
+	if (f->detector) { sg_detector_destroy(f->detector); f->detector = NULL; }
 
 	obs_enter_graphics();
-	if (f->stagesurface) {
-		gs_stagesurface_destroy(f->stagesurface);
-		f->stagesurface = NULL;
+	for (int i = 0; i < BUFFER_CAP; i++) {
+		if (f->ring[i]) gs_texrender_destroy(f->ring[i]);
 	}
-	if (f->texrender) {
-		gs_texrender_destroy(f->texrender);
-		f->texrender = NULL;
-	}
-	if (f->mask_tex) {
-		gs_texture_destroy(f->mask_tex);
-		f->mask_tex = NULL;
-	}
-	if (f->censor_effect) {
-		gs_effect_destroy(f->censor_effect);
-		f->censor_effect = NULL;
-	}
+	if (f->stagesurface) gs_stagesurface_destroy(f->stagesurface);
+	if (f->mask_tex) gs_texture_destroy(f->mask_tex);
+	if (f->censor_effect) gs_effect_destroy(f->censor_effect);
 	obs_leave_graphics();
 
 	pthread_mutex_destroy(&f->regions_mutex);
 	bfree(f);
 }
 
-static bool streamguard_readback_and_submit(struct streamguard_filter *f)
+/* Sample the source into ring[write_idx]. Returns the texture on success. */
+static gs_texture_t *streamguard_capture_source(struct streamguard_filter *f, uint32_t w,
+						uint32_t h)
 {
-	obs_source_t *target = obs_filter_get_target(f->source);
-	if (!target)
-		return false;
+	gs_texrender_t *tr = f->ring[f->write_idx];
+	gs_texrender_reset(tr);
+	if (!gs_texrender_begin(tr, w, h))
+		return NULL;
 
-	uint32_t width = obs_source_get_base_width(target);
-	uint32_t height = obs_source_get_base_height(target);
-	if (width == 0 || height == 0)
-		return false;
-
-	gs_texrender_reset(f->texrender);
-	if (!gs_texrender_begin(f->texrender, width, height))
-		return false;
-
-	struct vec4 background;
-	vec4_zero(&background);
-	gs_clear(GS_CLEAR_COLOR, &background, 0.0f, 0);
-	gs_ortho(0.0f, (float)width, 0.0f, (float)height, -100.0f, 100.0f);
+	struct vec4 bg;
+	vec4_zero(&bg);
+	gs_clear(GS_CLEAR_COLOR, &bg, 0.0f, 0);
+	gs_ortho(0.0f, (float)w, 0.0f, (float)h, -100.0f, 100.0f);
 
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
-	obs_source_video_render(target);
+	obs_source_t *target = obs_filter_get_target(f->source);
+	if (target)
+		obs_source_video_render(target);
 	gs_blend_state_pop();
-	gs_texrender_end(f->texrender);
+	gs_texrender_end(tr);
 
-	if (f->stagesurface && (f->stage_w != width || f->stage_h != height)) {
+	return gs_texrender_get_texture(tr);
+}
+
+static void streamguard_submit_ocr(struct streamguard_filter *f, gs_texture_t *source_tex,
+				   uint32_t w, uint32_t h)
+{
+	if (!source_tex)
+		return;
+
+	if (f->stagesurface && (f->stage_w != w || f->stage_h != h)) {
 		gs_stagesurface_destroy(f->stagesurface);
 		f->stagesurface = NULL;
 	}
 	if (!f->stagesurface) {
-		f->stagesurface = gs_stagesurface_create(width, height, GS_BGRA);
-		f->stage_w = width;
-		f->stage_h = height;
+		f->stagesurface = gs_stagesurface_create(w, h, GS_BGRA);
+		f->stage_w = w;
+		f->stage_h = h;
 	}
 
-	gs_stage_texture(f->stagesurface, gs_texrender_get_texture(f->texrender));
+	gs_stage_texture(f->stagesurface, source_tex);
 
 	uint8_t *video_data = NULL;
 	uint32_t linesize = 0;
 	if (!gs_stagesurface_map(f->stagesurface, &video_data, &linesize))
-		return false;
+		return;
 
-	bool submitted = sg_ocr_submit(f->ocr, video_data, (int)width, (int)height,
-				       (int)linesize, f->next_frame_id++, streamguard_ocr_done,
-				       f);
+	sg_ocr_submit(f->ocr, video_data, (int)w, (int)h, (int)linesize, f->next_frame_id++,
+		      streamguard_ocr_done, f);
 	gs_stagesurface_unmap(f->stagesurface);
-	return submitted;
+}
+
+static void streamguard_draw_black(uint32_t w, uint32_t h)
+{
+	gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+	if (!solid)
+		return;
+	gs_eparam_t *color = gs_effect_get_param_by_name(solid, "color");
+	struct vec4 black = {0.0f, 0.0f, 0.0f, 1.0f};
+	gs_effect_set_vec4(color, &black);
+	while (gs_effect_loop(solid, "Solid")) {
+		gs_draw_sprite(NULL, 0, w, h);
+	}
 }
 
 static void streamguard_filter_video_render(void *data, gs_effect_t *effect)
@@ -305,49 +317,68 @@ static void streamguard_filter_video_render(void *data, gs_effect_t *effect)
 	UNUSED_PARAMETER(effect);
 	struct streamguard_filter *f = data;
 
-	uint64_t now = os_gettime_ns();
-	if (now - f->last_ocr_ns >= f->ocr_interval_ns) {
-		if (streamguard_readback_and_submit(f)) {
-			f->last_ocr_ns = now;
-		}
-	}
-
-	streamguard_prune_regions(f, now);
-
-	if (!f->censor_effect || !f->mask_tex) {
+	obs_source_t *target = obs_filter_get_target(f->source);
+	uint32_t w = target ? obs_source_get_base_width(target) : 0;
+	uint32_t h = target ? obs_source_get_base_height(target) : 0;
+	if (!target || w == 0 || h == 0 || !f->censor_effect) {
 		obs_source_skip_video_filter(f->source);
 		return;
 	}
 
+	/* 1. Capture current source frame into ring[write_idx]. */
+	gs_texture_t *fresh = streamguard_capture_source(f, w, h);
+	if (!fresh) {
+		obs_source_skip_video_filter(f->source);
+		return;
+	}
+
+	/* 2. Kick OCR on the fresh frame at the throttled rate. OCR submit
+	 * makes its own copy of the pixel data, so the ring slot is free to
+	 * be overwritten on the next tick. */
+	uint64_t now = os_gettime_ns();
+	if (now - f->last_ocr_ns >= f->ocr_interval_ns) {
+		streamguard_submit_ocr(f, fresh, w, h);
+		f->last_ocr_ns = now;
+	}
+
+	/* 3. Expire regions older than TTL. */
+	streamguard_prune_regions(f, now);
+
+	/* 4. Rebuild the censor mask from current regions. */
 	streamguard_build_mask(f);
 	gs_texture_set_image(f->mask_tex, f->mask_buf, MASK_W, false);
 
-	/* Once a second: what does the render path see? */
+	/* Once a second: visibility into the pipeline state. */
 	static uint64_t s_last_diag_ns = 0;
 	if (now - s_last_diag_ns > 1000000000ULL) {
 		s_last_diag_ns = now;
 		pthread_mutex_lock(&f->regions_mutex);
 		int rc = f->region_count;
-		float rx = rc > 0 ? f->regions[0].x : 0.0f;
-		float ry = rc > 0 ? f->regions[0].y : 0.0f;
-		float rw = rc > 0 ? f->regions[0].w : 0.0f;
-		float rh = rc > 0 ? f->regions[0].h : 0.0f;
 		pthread_mutex_unlock(&f->regions_mutex);
 		obs_log(LOG_INFO,
-			"render: regions=%d first=(%.2f,%.2f %.2fx%.2f) effect=%p mask=%p",
-			rc, rx, ry, rw, rh, (void *)f->censor_effect,
-			(void *)f->mask_tex);
+			"render: items=%d/%d regions=%d write=%d read=%d", f->items,
+			BUFFER_DELAY_FRAMES, rc, f->write_idx, f->read_idx);
 	}
 
-	if (!obs_source_process_filter_begin(f->source, GS_RGBA, OBS_NO_DIRECT_RENDERING))
-		return;
+	/* 5. Output: delayed frame through censor effect, or black during warmup. */
+	if (f->items > BUFFER_DELAY_FRAMES) {
+		gs_texture_t *delayed = gs_texrender_get_texture(f->ring[f->read_idx]);
+		if (delayed) {
+			gs_effect_set_texture(f->param_image, delayed);
+			gs_effect_set_texture(f->param_mask, f->mask_tex);
+			while (gs_effect_loop(f->censor_effect, "Draw")) {
+				gs_draw_sprite(delayed, 0, w, h);
+			}
+		}
+		f->read_idx = (f->read_idx + 1) % BUFFER_CAP;
+		f->items--;
+	} else {
+		streamguard_draw_black(w, h);
+	}
 
-	if (f->param_mask)
-		gs_effect_set_texture(f->param_mask, f->mask_tex);
-
-	obs_source_process_filter_end(f->source, f->censor_effect,
-				      obs_source_get_base_width(f->source),
-				      obs_source_get_base_height(f->source));
+	/* 6. Advance the writer. */
+	f->write_idx = (f->write_idx + 1) % BUFFER_CAP;
+	f->items++;
 }
 
 struct obs_source_info streamguard_filter_info = {
