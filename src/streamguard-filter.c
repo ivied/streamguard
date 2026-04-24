@@ -232,9 +232,33 @@ static void streamguard_build_mask(struct streamguard_filter *f, uint64_t now_ns
 	pthread_mutex_unlock(&f->regions_mutex);
 }
 
+static obs_properties_t *streamguard_filter_get_properties(void *data)
+{
+	UNUSED_PARAMETER(data);
+	obs_properties_t *props = obs_properties_create();
+	obs_properties_add_bool(props, "ignore_urls",
+				obs_module_text("StreamGuard.IgnoreUrls"));
+	return props;
+}
+
+static void streamguard_filter_get_defaults(obs_data_t *settings)
+{
+	obs_data_set_default_bool(settings, "ignore_urls", true);
+}
+
+static void streamguard_filter_update(void *data, obs_data_t *settings)
+{
+	struct streamguard_filter *f = data;
+	if (!f || !settings)
+		return;
+	if (f->detector) {
+		bool ignore_urls = obs_data_get_bool(settings, "ignore_urls");
+		sg_detector_set_ignore_urls(f->detector, ignore_urls);
+	}
+}
+
 static void *streamguard_filter_create(obs_data_t *settings, obs_source_t *source)
 {
-	UNUSED_PARAMETER(settings);
 	struct streamguard_filter *f = bzalloc(sizeof(struct streamguard_filter));
 	f->source = source;
 	f->ocr_interval_ns = OCR_INTERVAL_NS_DEFAULT;
@@ -265,6 +289,10 @@ static void *streamguard_filter_create(obs_data_t *settings, obs_source_t *sourc
 
 	f->ocr = sg_ocr_create();
 	f->detector = sg_detector_create();
+
+	/* Apply whatever was saved in settings (or the defaults set via
+	 * get_defaults before create). */
+	streamguard_filter_update(f, settings);
 	return f;
 }
 
@@ -433,4 +461,7 @@ struct obs_source_info streamguard_filter_info = {
 	.create = streamguard_filter_create,
 	.destroy = streamguard_filter_destroy,
 	.video_render = streamguard_filter_video_render,
+	.get_properties = streamguard_filter_get_properties,
+	.get_defaults = streamguard_filter_get_defaults,
+	.update = streamguard_filter_update,
 };

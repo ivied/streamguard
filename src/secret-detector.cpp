@@ -88,6 +88,16 @@ std::string densest_token(const std::string &s)
 	return best;
 }
 
+// A URL-ish look (http://, https://, www.). Loose on trailing chars —
+// OCR often mangles the tail, but the prefix is what we care about.
+bool looks_like_url(const std::string &s)
+{
+	static const std::regex url_re(
+		R"((?:https?://|www\.)\S{3,})",
+		std::regex::ECMAScript | std::regex::optimize | std::regex::icase);
+	return std::regex_search(s, url_re);
+}
+
 std::string to_lower(const std::string &s)
 {
 	std::string out(s);
@@ -226,6 +236,10 @@ struct sg_detector {
 	// the threshold. Accepts some extra false positives on normal code
 	// identifiers as the cost.
 	size_t entropy_min_len = 14;
+	// When true (default), URL-looking text is not flagged by entropy or
+	// label-proximity. Content-regex rules (AWS, GitHub, etc.) still
+	// apply, since a leaked key could in principle appear in a URL.
+	bool ignore_urls = true;
 };
 
 extern "C" sg_detector *sg_detector_create(void)
@@ -238,6 +252,12 @@ extern "C" sg_detector *sg_detector_create(void)
 extern "C" void sg_detector_destroy(sg_detector *d)
 {
 	delete d;
+}
+
+extern "C" void sg_detector_set_ignore_urls(sg_detector *d, bool value)
+{
+	if (d)
+		d->ignore_urls = value;
 }
 
 extern "C" bool sg_detector_check(sg_detector *d, const char *text, const char **matched_rule)
@@ -256,6 +276,12 @@ extern "C" bool sg_detector_check(sg_detector *d, const char *text, const char *
 			return true;
 		}
 	}
+
+	// URLs slip past the content-regex pass above but will trip entropy
+	// on their random-looking path / query. Skip entropy for them when
+	// the toggle is on.
+	if (d->ignore_urls && looks_like_url(s))
+		return false;
 
 	std::string tok = densest_token(s);
 	if (tok.size() >= d->entropy_min_len &&
@@ -293,6 +319,8 @@ extern "C" void sg_detector_check_all(sg_detector *d, const sg_ocr_box *boxes, i
 			if (j == i || out_flags[j])
 				continue;
 			if (!is_plausible_value(boxes[j].text))
+				continue;
+			if (d->ignore_urls && looks_like_url(boxes[j].text))
 				continue;
 			Box cb{boxes[j].x, boxes[j].y, boxes[j].w, boxes[j].h};
 			if (is_adjacent_to_label(lb, cb)) {

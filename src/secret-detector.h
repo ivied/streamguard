@@ -29,6 +29,12 @@ typedef struct sg_detector sg_detector;
 sg_detector *sg_detector_create(void);
 void sg_detector_destroy(sg_detector *d);
 
+/*
+ * Toggles. Safe to call from any thread at any time — each setter flips a
+ * single bool in the detector struct; readers pick it up on the next check.
+ */
+void sg_detector_set_ignore_urls(sg_detector *d, bool value);
+
 bool sg_detector_check(sg_detector *d, const char *text, const char **matched_rule);
 
 /*
