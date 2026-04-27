@@ -34,6 +34,8 @@ void sg_detector_destroy(sg_detector *d);
  * single bool in the detector struct; readers pick it up on the next check.
  */
 void sg_detector_set_ignore_urls(sg_detector *d, bool value);
+void sg_detector_set_use_entropy(sg_detector *d, bool value);
+void sg_detector_set_use_label_proximity(sg_detector *d, bool value);
 
 bool sg_detector_check(sg_detector *d, const char *text, const char **matched_rule);
 

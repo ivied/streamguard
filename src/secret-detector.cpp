@@ -240,6 +240,10 @@ struct sg_detector {
 	// label-proximity. Content-regex rules (AWS, GitHub, etc.) still
 	// apply, since a leaked key could in principle appear in a URL.
 	bool ignore_urls = true;
+	// Master switches for the two non-regex detection paths. Regex rules
+	// are always on — they're cheap and very specific.
+	bool use_entropy = true;
+	bool use_label_proximity = true;
 };
 
 extern "C" sg_detector *sg_detector_create(void)
@@ -260,6 +264,18 @@ extern "C" void sg_detector_set_ignore_urls(sg_detector *d, bool value)
 		d->ignore_urls = value;
 }
 
+extern "C" void sg_detector_set_use_entropy(sg_detector *d, bool value)
+{
+	if (d)
+		d->use_entropy = value;
+}
+
+extern "C" void sg_detector_set_use_label_proximity(sg_detector *d, bool value)
+{
+	if (d)
+		d->use_label_proximity = value;
+}
+
 extern "C" bool sg_detector_check(sg_detector *d, const char *text, const char **matched_rule)
 {
 	if (!d || !text)
@@ -276,6 +292,9 @@ extern "C" bool sg_detector_check(sg_detector *d, const char *text, const char *
 			return true;
 		}
 	}
+
+	if (!d->use_entropy)
+		return false;
 
 	// URLs slip past the content-regex pass above but will trip entropy
 	// on their random-looking path / query. Skip entropy for them when
@@ -308,6 +327,9 @@ extern "C" void sg_detector_check_all(sg_detector *d, const sg_ocr_box *boxes, i
 			out_flags[i] = true;
 		}
 	}
+
+	if (!d->use_label_proximity)
+		return;
 
 	// Pass 2: spatial label proximity. For every label, mark any
 	// plausible-value neighbour as a secret if it isn't already flagged.

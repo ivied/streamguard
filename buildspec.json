@@ -32,7 +32,7 @@
     },
     "name": "streamguard",
     "displayName": "StreamGuard",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "author": "Sergey Kurdyuk",
     "website": "https://github.com/ivied/streamguard",
     "email": "sudorous@gmail.com"

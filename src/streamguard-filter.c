@@ -1,14 +1,21 @@
 /*
-StreamGuard filter — video filter that buffers frames, runs Apple Vision
-OCR on the freshest frame each tick, detects secrets, and outputs delayed
-frames with censor mask applied.
+StreamGuard filter — buffers frames, runs Apple Vision OCR on the freshest
+frame each tick, detects secrets, and outputs delayed frames with a censor
+mask applied. Most pipeline knobs are exposed in the filter properties:
 
-The frame buffer (ring of N+1 texrenders) is the key trick: we output a
-frame that was sampled ~30 ticks ago, so by the time it reaches the
-encoder, OCR has already inspected it and our region list reflects its
-contents. Without the buffer, a newly appearing secret would be visible
-on stream for 100–600ms until OCR caught up — unsafe for the threat
-model.
+  - "Max processing resolution"    → pipeline_max_dim
+  - "OCR rate when active"         → ocr_active_ns
+  - "OCR rate when idle"           → ocr_idle_ns
+  - "Buffer delay (ms)"            → effective_delay_frames
+  - "Blur strength"                → blur_radius
+  - "Don't blur URLs"              → detector flag
+  - "Detect random-looking …"      → detector flag (entropy)
+  - "Detect by label proximity"    → detector flag
+
+The frame buffer (ring of N+1 texrenders) is the safety mechanism: we
+output a frame that was sampled `effective_delay_frames` ticks ago, so
+by the time it reaches the encoder Vision has had time to inspect it
+and our region list reflects its contents.
 */
 
 #include <obs-module.h>
@@ -21,42 +28,48 @@ model.
 #include "vision-ocr.h"
 #include "secret-detector.h"
 
-#define OCR_INTERVAL_NS_DEFAULT 250000000ULL    /* 250 ms = 4 Hz */
-#define REGION_TTL_NS_DEFAULT   2500000000ULL   /* keep censor up 2.5s after last detect */
-#define REGION_PAD_PCT_DEFAULT  0.30f           /* baseline padding on every side */
-/* Age-based inflation: by the time a region hits this age (≈ OCR period)
- * we've added AGE_INFLATION_MAX on every side on top of the base padding.
- * Covers motion within the inter-tick dead time, and also compensates for
- * OCR sometimes missing parts of a string that a neighbour tick caught. */
-#define REGION_AGE_INFLATION_MAX 0.25f
+/* The ring is sized for the largest delay we expose in the UI (1500ms at
+ * 60 fps = 90 frames + 2). Slots that aren't used in the current setting
+ * never get rendered into and so cost no GPU memory — gs_texrender only
+ * allocates a backing texture on first gs_texrender_begin. */
+#define MAX_DELAY_FRAMES        90
+#define BUFFER_CAP              (MAX_DELAY_FRAMES + 2)
+
+#define DEFAULT_DELAY_MS        500
+#define DEFAULT_OCR_HZ          4
+#define DEFAULT_OCR_IDLE_HZ     2
+#define DEFAULT_MAX_DIM         1080
+/* Switch to idle rate once we've gone this many OCR ticks with zero hits. */
+#define IDLE_THRESHOLD_TICKS    8
+
+#define REGION_TTL_NS_DEFAULT   2500000000ULL
+#define REGION_PAD_PCT_DEFAULT  0.30f
+#define REGION_AGE_INFLATION_MAX     0.25f
 #define REGION_AGE_INFLATION_FULL_NS 300000000ULL
 #define MAX_REGIONS             64
 #define MASK_W                  320
 #define MASK_H                  180
 
-/* Ring size = delay + 2. The +2 is load-bearing: we write first, then read
- * in the same tick. With cap = delay + 1, the read slot and the just-written
- * slot are identical after the first wrap, so "delayed" output = freshly
- * captured pixels and the delay collapses to zero. The extra slot keeps
- * write and read always pointing at different textures. */
-#define BUFFER_DELAY_FRAMES     45              /* ~750ms at 60fps */
-#define BUFFER_CAP              (BUFFER_DELAY_FRAMES + 2)
+/* "Blur strength" enum values, mapped to UV radius. */
+#define BLUR_LOW     0.008f
+#define BLUR_MEDIUM  0.015f
+#define BLUR_HIGH    0.025f
 
 struct sg_region {
-	float x, y, w, h; /* normalized UV, top-left origin */
+	float x, y, w, h;
 	uint64_t last_seen_ns;
 };
 
 struct streamguard_filter {
 	obs_source_t *source;
 
-	/* Delay ring: each slot holds one captured source frame. */
+	/* Delay ring. */
 	gs_texrender_t *ring[BUFFER_CAP];
-	uint32_t ring_w;
-	uint32_t ring_h;
 	int write_idx;
 	int read_idx;
 	int items;
+	int effective_delay_frames; /* updated from the delay-ms setting */
+	int effective_cap;          /* effective_delay_frames + 2 */
 
 	gs_stagesurf_t *stagesurface;
 	uint32_t stage_w;
@@ -64,13 +77,22 @@ struct streamguard_filter {
 
 	sg_ocr_ctx *ocr;
 	sg_detector *detector;
-	uint64_t ocr_interval_ns;
+
+	/* OCR pacing — adaptive between active and idle rate. */
+	uint64_t ocr_active_ns;
+	uint64_t ocr_idle_ns;
 	uint64_t last_ocr_ns;
 	uint64_t next_frame_id;
+	int idle_streak; /* OCR ticks in a row with zero hits */
+
+	/* Pipeline cap: render-time downsample target. 0 = no cap. */
+	int pipeline_max_dim;
 
 	gs_effect_t *censor_effect;
 	gs_eparam_t *param_image;
 	gs_eparam_t *param_mask;
+	gs_eparam_t *param_blur_radius;
+	float blur_radius;
 
 	gs_texture_t *mask_tex;
 	uint8_t mask_buf[MASK_W * MASK_H];
@@ -105,7 +127,6 @@ static void streamguard_add_region(struct streamguard_filter *f, float x, float 
 		return;
 
 	pthread_mutex_lock(&f->regions_mutex);
-
 	for (int i = 0; i < f->region_count; i++) {
 		struct sg_region *r = &f->regions[i];
 		float ix = fmaxf(r->x, x);
@@ -113,11 +134,6 @@ static void streamguard_add_region(struct streamguard_filter *f, float x, float 
 		float ax = fminf(r->x + r->w, x + w);
 		float ay = fminf(r->y + r->h, y + h);
 		if (ax > ix && ay > iy) {
-			/* Union with existing rect. OCR bboxes fluctuate between
-			 * ticks — one tick may only catch "AKIA..." while the next
-			 * catches the whole key. Replacing would briefly expose the
-			 * missed letters; unioning keeps the widest envelope we've
-			 * ever seen for this text. */
 			float nx = fminf(r->x, x);
 			float ny = fminf(r->y, y);
 			r->w = fmaxf(r->x + r->w, x + w) - nx;
@@ -129,7 +145,6 @@ static void streamguard_add_region(struct streamguard_filter *f, float x, float 
 			return;
 		}
 	}
-
 	if (f->region_count < MAX_REGIONS) {
 		struct sg_region *r = &f->regions[f->region_count++];
 		r->x = x; r->y = y; r->w = w; r->h = h;
@@ -158,6 +173,7 @@ static void streamguard_ocr_done(sg_ocr_result *result, void *user_data)
 		return;
 
 	uint64_t now = os_gettime_ns();
+	int hits = 0;
 
 	if (f && f->detector && result->count > 0) {
 		bool *flags = bzalloc(sizeof(bool) * (size_t)result->count);
@@ -166,13 +182,11 @@ static void streamguard_ocr_done(sg_ocr_result *result, void *user_data)
 		sg_detector_check_all(f->detector, result->boxes, result->count, flags,
 				      rules);
 
-		int hits = 0;
 		for (int i = 0; i < result->count; i++) {
 			if (!flags[i])
 				continue;
 			hits++;
 			sg_ocr_box *b = &result->boxes[i];
-			/* Vision bottom-left → UV top-left */
 			float uv_x = b->x;
 			float uv_y = 1.0f - b->y - b->h;
 			streamguard_add_region(f, uv_x, uv_y, b->w, b->h, now);
@@ -190,6 +204,13 @@ static void streamguard_ocr_done(sg_ocr_result *result, void *user_data)
 		bfree(rules);
 	}
 
+	if (f) {
+		if (hits > 0)
+			f->idle_streak = 0;
+		else
+			f->idle_streak++;
+	}
+
 	sg_ocr_free_result(result);
 }
 
@@ -199,12 +220,6 @@ static void streamguard_build_mask(struct streamguard_filter *f, uint64_t now_ns
 	pthread_mutex_lock(&f->regions_mutex);
 	for (int i = 0; i < f->region_count; i++) {
 		struct sg_region *r = &f->regions[i];
-
-		/* Age-based inflation: a region that was freshly detected this
-		 * tick draws at its base size; one getting close to the next
-		 * OCR tick draws inflated to catch motion happening in the
-		 * dead time. Yes this causes visible pulsing at the OCR rate
-		 * on static content — user-preferred trade vs motion leaks. */
 		uint64_t age_ns = now_ns - r->last_seen_ns;
 		float age_factor = (float)age_ns / (float)REGION_AGE_INFLATION_FULL_NS;
 		if (age_factor > 1.0f) age_factor = 1.0f;
@@ -236,14 +251,76 @@ static obs_properties_t *streamguard_filter_get_properties(void *data)
 {
 	UNUSED_PARAMETER(data);
 	obs_properties_t *props = obs_properties_create();
-	obs_properties_add_bool(props, "ignore_urls",
-				obs_module_text("StreamGuard.IgnoreUrls"));
+	obs_property_t *p;
+
+	p = obs_properties_add_list(props, "max_resolution",
+				    obs_module_text("StreamGuard.MaxResolution"),
+				    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, obs_module_text("StreamGuard.MaxResolution.Native"), 0);
+	obs_property_list_add_int(p, obs_module_text("StreamGuard.MaxResolution.720"), 720);
+	obs_property_list_add_int(p, obs_module_text("StreamGuard.MaxResolution.1080"), 1080);
+	obs_property_list_add_int(p, obs_module_text("StreamGuard.MaxResolution.1440"), 1440);
+	obs_property_set_long_description(
+		p, obs_module_text("StreamGuard.MaxResolution.Description"));
+
+	p = obs_properties_add_int_slider(props, "ocr_active_hz",
+					  obs_module_text("StreamGuard.OcrRateHz"), 1, 10, 1);
+	obs_property_set_long_description(p,
+					  obs_module_text("StreamGuard.OcrRateHz.Description"));
+
+	p = obs_properties_add_int_slider(props, "ocr_idle_hz",
+					  obs_module_text("StreamGuard.OcrIdleRateHz"), 1, 6, 1);
+	obs_property_set_long_description(
+		p, obs_module_text("StreamGuard.OcrIdleRateHz.Description"));
+
+	p = obs_properties_add_int_slider(props, "buffer_delay_ms",
+					  obs_module_text("StreamGuard.BufferDelayMs"), 300,
+					  1500, 50);
+	obs_property_set_long_description(
+		p, obs_module_text("StreamGuard.BufferDelayMs.Description"));
+
+	p = obs_properties_add_list(props, "blur_strength",
+				    obs_module_text("StreamGuard.BlurStrength"),
+				    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, obs_module_text("StreamGuard.BlurStrength.Low"), 0);
+	obs_property_list_add_int(p, obs_module_text("StreamGuard.BlurStrength.Medium"), 1);
+	obs_property_list_add_int(p, obs_module_text("StreamGuard.BlurStrength.High"), 2);
+	obs_property_set_long_description(p,
+					  obs_module_text("StreamGuard.BlurStrength.Description"));
+
+	p = obs_properties_add_bool(props, "ignore_urls",
+				    obs_module_text("StreamGuard.IgnoreUrls"));
+	obs_property_set_long_description(p,
+					  obs_module_text("StreamGuard.IgnoreUrls.Description"));
+
+	p = obs_properties_add_bool(props, "use_entropy",
+				    obs_module_text("StreamGuard.UseEntropy"));
+	obs_property_set_long_description(p,
+					  obs_module_text("StreamGuard.UseEntropy.Description"));
+
+	p = obs_properties_add_bool(props, "use_label_proximity",
+				    obs_module_text("StreamGuard.UseLabelProximity"));
+	obs_property_set_long_description(
+		p, obs_module_text("StreamGuard.UseLabelProximity.Description"));
+
 	return props;
 }
 
 static void streamguard_filter_get_defaults(obs_data_t *settings)
 {
+	obs_data_set_default_int(settings, "max_resolution", DEFAULT_MAX_DIM);
+	obs_data_set_default_int(settings, "ocr_active_hz", DEFAULT_OCR_HZ);
+	obs_data_set_default_int(settings, "ocr_idle_hz", DEFAULT_OCR_IDLE_HZ);
+	obs_data_set_default_int(settings, "buffer_delay_ms", DEFAULT_DELAY_MS);
+	obs_data_set_default_int(settings, "blur_strength", 1); /* Medium */
 	obs_data_set_default_bool(settings, "ignore_urls", true);
+	obs_data_set_default_bool(settings, "use_entropy", true);
+	obs_data_set_default_bool(settings, "use_label_proximity", true);
+}
+
+static int clamp_int(int v, int lo, int hi)
+{
+	return v < lo ? lo : (v > hi ? hi : v);
 }
 
 static void streamguard_filter_update(void *data, obs_data_t *settings)
@@ -251,9 +328,43 @@ static void streamguard_filter_update(void *data, obs_data_t *settings)
 	struct streamguard_filter *f = data;
 	if (!f || !settings)
 		return;
+
+	f->pipeline_max_dim = (int)obs_data_get_int(settings, "max_resolution");
+
+	int active_hz = clamp_int((int)obs_data_get_int(settings, "ocr_active_hz"), 1, 10);
+	int idle_hz = clamp_int((int)obs_data_get_int(settings, "ocr_idle_hz"), 1, 6);
+	if (idle_hz > active_hz)
+		idle_hz = active_hz;
+	f->ocr_active_ns = 1000000000ULL / (uint64_t)active_hz;
+	f->ocr_idle_ns = 1000000000ULL / (uint64_t)idle_hz;
+
+	int delay_ms = clamp_int((int)obs_data_get_int(settings, "buffer_delay_ms"), 300, 1500);
+	int new_frames = clamp_int(delay_ms * 60 / 1000, 1, MAX_DELAY_FRAMES);
+	if (new_frames != f->effective_delay_frames) {
+		f->effective_delay_frames = new_frames;
+		f->effective_cap = new_frames + 2;
+		/* Reset the ring; in-flight slots beyond the new cap would
+		 * never get reached otherwise and the warmup logic would
+		 * read uninitialised slots. */
+		f->write_idx = 0;
+		f->read_idx = 0;
+		f->items = 0;
+	}
+
+	int strength = (int)obs_data_get_int(settings, "blur_strength");
+	switch (strength) {
+	case 0: f->blur_radius = BLUR_LOW; break;
+	case 2: f->blur_radius = BLUR_HIGH; break;
+	default: f->blur_radius = BLUR_MEDIUM; break;
+	}
+
 	if (f->detector) {
-		bool ignore_urls = obs_data_get_bool(settings, "ignore_urls");
-		sg_detector_set_ignore_urls(f->detector, ignore_urls);
+		sg_detector_set_ignore_urls(f->detector,
+					    obs_data_get_bool(settings, "ignore_urls"));
+		sg_detector_set_use_entropy(f->detector,
+					    obs_data_get_bool(settings, "use_entropy"));
+		sg_detector_set_use_label_proximity(
+			f->detector, obs_data_get_bool(settings, "use_label_proximity"));
 	}
 }
 
@@ -261,9 +372,14 @@ static void *streamguard_filter_create(obs_data_t *settings, obs_source_t *sourc
 {
 	struct streamguard_filter *f = bzalloc(sizeof(struct streamguard_filter));
 	f->source = source;
-	f->ocr_interval_ns = OCR_INTERVAL_NS_DEFAULT;
 	f->region_ttl_ns = REGION_TTL_NS_DEFAULT;
 	f->region_pad_pct = REGION_PAD_PCT_DEFAULT;
+	f->effective_delay_frames = MAX_DELAY_FRAMES; /* overwritten by update() */
+	f->effective_cap = BUFFER_CAP;
+	f->ocr_active_ns = 1000000000ULL / DEFAULT_OCR_HZ;
+	f->ocr_idle_ns = 1000000000ULL / DEFAULT_OCR_IDLE_HZ;
+	f->blur_radius = BLUR_MEDIUM;
+	f->pipeline_max_dim = DEFAULT_MAX_DIM;
 	pthread_mutex_init(&f->regions_mutex, NULL);
 
 	obs_enter_graphics();
@@ -278,8 +394,12 @@ static void *streamguard_filter_create(obs_data_t *settings, obs_source_t *sourc
 	if (f->censor_effect) {
 		f->param_image = gs_effect_get_param_by_name(f->censor_effect, "image");
 		f->param_mask = gs_effect_get_param_by_name(f->censor_effect, "mask");
-		obs_log(LOG_INFO, "censor effect loaded: image=%p mask=%p",
-			(void *)f->param_image, (void *)f->param_mask);
+		f->param_blur_radius =
+			gs_effect_get_param_by_name(f->censor_effect, "blur_radius");
+		obs_log(LOG_INFO,
+			"censor effect loaded: image=%p mask=%p blur_radius=%p",
+			(void *)f->param_image, (void *)f->param_mask,
+			(void *)f->param_blur_radius);
 	} else {
 		obs_log(LOG_ERROR, "failed to load streamguard-censor.effect");
 	}
@@ -290,8 +410,6 @@ static void *streamguard_filter_create(obs_data_t *settings, obs_source_t *sourc
 	f->ocr = sg_ocr_create();
 	f->detector = sg_detector_create();
 
-	/* Apply whatever was saved in settings (or the defaults set via
-	 * get_defaults before create). */
 	streamguard_filter_update(f, settings);
 	return f;
 }
@@ -318,7 +436,33 @@ static void streamguard_filter_destroy(void *data)
 	bfree(f);
 }
 
-/* Sample the source into ring[write_idx]. Returns the texture on success. */
+/* Compute internal pipeline (capture + ring + OCR) dimensions, clamped to
+ * the user's "Max processing resolution" setting. Aspect ratio preserved. */
+static void streamguard_compute_pipeline_dims(const struct streamguard_filter *f,
+					      uint32_t src_w, uint32_t src_h,
+					      uint32_t *out_w, uint32_t *out_h)
+{
+	if (f->pipeline_max_dim <= 0) {
+		*out_w = src_w;
+		*out_h = src_h;
+		return;
+	}
+	uint32_t max_dim = (uint32_t)f->pipeline_max_dim;
+	if (src_w <= max_dim && src_h <= max_dim) {
+		*out_w = src_w;
+		*out_h = src_h;
+		return;
+	}
+	double scale =
+		(double)max_dim / (double)(src_w > src_h ? src_w : src_h);
+	uint32_t scaled_w = (uint32_t)((double)src_w * scale + 0.5);
+	uint32_t scaled_h = (uint32_t)((double)src_h * scale + 0.5);
+	if (scaled_w < 2) scaled_w = 2;
+	if (scaled_h < 2) scaled_h = 2;
+	*out_w = scaled_w;
+	*out_h = scaled_h;
+}
+
 static gs_texture_t *streamguard_capture_source(struct streamguard_filter *f, uint32_t w,
 						uint32_t h)
 {
@@ -390,66 +534,66 @@ static void streamguard_filter_video_render(void *data, gs_effect_t *effect)
 	struct streamguard_filter *f = data;
 
 	obs_source_t *target = obs_filter_get_target(f->source);
-	uint32_t w = target ? obs_source_get_base_width(target) : 0;
-	uint32_t h = target ? obs_source_get_base_height(target) : 0;
-	if (!target || w == 0 || h == 0 || !f->censor_effect) {
+	uint32_t src_w = target ? obs_source_get_base_width(target) : 0;
+	uint32_t src_h = target ? obs_source_get_base_height(target) : 0;
+	if (!target || src_w == 0 || src_h == 0 || !f->censor_effect) {
 		obs_source_skip_video_filter(f->source);
 		return;
 	}
 
-	/* 1. Capture current source frame into ring[write_idx]. */
-	gs_texture_t *fresh = streamguard_capture_source(f, w, h);
+	uint32_t cap_w, cap_h;
+	streamguard_compute_pipeline_dims(f, src_w, src_h, &cap_w, &cap_h);
+
+	gs_texture_t *fresh = streamguard_capture_source(f, cap_w, cap_h);
 	if (!fresh) {
 		obs_source_skip_video_filter(f->source);
 		return;
 	}
 
-	/* 2. Kick OCR on the fresh frame at the throttled rate. OCR submit
-	 * makes its own copy of the pixel data, so the ring slot is free to
-	 * be overwritten on the next tick. */
 	uint64_t now = os_gettime_ns();
-	if (now - f->last_ocr_ns >= f->ocr_interval_ns) {
-		streamguard_submit_ocr(f, fresh, w, h);
+	uint64_t interval = (f->idle_streak >= IDLE_THRESHOLD_TICKS) ? f->ocr_idle_ns
+								     : f->ocr_active_ns;
+	if (now - f->last_ocr_ns >= interval) {
+		streamguard_submit_ocr(f, fresh, cap_w, cap_h);
 		f->last_ocr_ns = now;
 	}
 
-	/* 3. Expire regions older than TTL. */
 	streamguard_prune_regions(f, now);
-
-	/* 4. Rebuild the censor mask from current regions (with motion extrapolation). */
 	streamguard_build_mask(f, now);
 	gs_texture_set_image(f->mask_tex, f->mask_buf, MASK_W, false);
 
-	/* Once a second: visibility into the pipeline state. */
 	static uint64_t s_last_diag_ns = 0;
-	if (now - s_last_diag_ns > 1000000000ULL) {
+	if (now - s_last_diag_ns > 2000000000ULL) {
 		s_last_diag_ns = now;
 		pthread_mutex_lock(&f->regions_mutex);
 		int rc = f->region_count;
 		pthread_mutex_unlock(&f->regions_mutex);
 		obs_log(LOG_INFO,
-			"render: items=%d/%d regions=%d write=%d read=%d", f->items,
-			BUFFER_DELAY_FRAMES, rc, f->write_idx, f->read_idx);
+			"render: cap=%ux%u src=%ux%u delay_frames=%d items=%d regions=%d idle=%d",
+			cap_w, cap_h, src_w, src_h, f->effective_delay_frames, f->items, rc,
+			f->idle_streak);
 	}
 
-	/* 5. Output: delayed frame through censor effect, or black during warmup. */
-	if (f->items > BUFFER_DELAY_FRAMES) {
+	if (f->items > f->effective_delay_frames) {
 		gs_texture_t *delayed = gs_texrender_get_texture(f->ring[f->read_idx]);
 		if (delayed) {
 			gs_effect_set_texture(f->param_image, delayed);
 			gs_effect_set_texture(f->param_mask, f->mask_tex);
+			if (f->param_blur_radius)
+				gs_effect_set_float(f->param_blur_radius, f->blur_radius);
 			while (gs_effect_loop(f->censor_effect, "Draw")) {
-				gs_draw_sprite(delayed, 0, w, h);
+				/* Output at full source dims; the GPU upsamples
+				 * the (possibly downscaled) ring slot. */
+				gs_draw_sprite(delayed, 0, src_w, src_h);
 			}
 		}
-		f->read_idx = (f->read_idx + 1) % BUFFER_CAP;
+		f->read_idx = (f->read_idx + 1) % f->effective_cap;
 		f->items--;
 	} else {
-		streamguard_draw_black(w, h);
+		streamguard_draw_black(src_w, src_h);
 	}
 
-	/* 6. Advance the writer. */
-	f->write_idx = (f->write_idx + 1) % BUFFER_CAP;
+	f->write_idx = (f->write_idx + 1) % f->effective_cap;
 	f->items++;
 }
 

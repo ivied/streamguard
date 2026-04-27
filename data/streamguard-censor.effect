@@ -5,7 +5,8 @@
 // tripped over dynamic array indexing in shaders, so we keep everything
 // constant-addressed.
 //
-// Strength is a compile-time radius in UV space. At 1.5% UV ≈ 16px per
+// Strength is a uniform `blur_radius` in UV space, set from the C side
+// based on the user's "Blur strength" selection. At 0.015 UV ≈ 16px per
 // 1080p row, which reliably kills per-character legibility for typical
 // ~1% UV text height.
 //
@@ -16,6 +17,7 @@
 uniform float4x4 ViewProj;
 uniform texture2d image;
 uniform texture2d mask;
+uniform float blur_radius;
 
 sampler_state def_sampler {
 	Filter   = Linear;
@@ -51,7 +53,7 @@ float4 PSCensor(VertInOut vert_in) : TARGET
 		return src;
 	}
 
-	float r = 0.015;
+	float r = blur_radius;
 	float d = r * 0.7071;
 
 	float4 acc = src;
